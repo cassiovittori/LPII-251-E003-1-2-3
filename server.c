@@ -9,6 +9,7 @@
 
 #define INITIAL_CAPACITY 10
 #define BUFFER_SIZE 2048
+#define HISTORY_SIZE 10 
 
 // Estrutura para representar um cliente conectado
 typedef struct {
@@ -23,6 +24,12 @@ static int client_count = 0;
 static int client_capacity = INITIAL_CAPACITY;
 static int next_client_id = 1;
 static pthread_mutex_t clients_mutex;
+
+// GLOBAIS PARA O HISTÓRICO DE MENSAGENS
+static char *message_history[HISTORY_SIZE];
+static int history_count = 0;
+static int history_head = 0;
+static pthread_mutex_t history_mutex;
 
 // Adiciona um cliente à lista. A lista já deve estar travada com o mutex.
 void add_client(client_t client) {
@@ -42,12 +49,58 @@ void remove_client(int id) {
     int i;
     for (i = 0; i < client_count; i++) {
         if (clients[i].id == id) {
-            // Move os clientes subsequentes para preencher o espaço
             memmove(&clients[i], &clients[i + 1], (client_count - i - 1) * sizeof(client_t));
             client_count--;
             break;
         }
     }
+}
+
+void init_history() {
+    pthread_mutex_init(&history_mutex, NULL);
+    for (int i = 0; i < HISTORY_SIZE; i++) {
+        message_history[i] = NULL;
+    }
+}
+
+void add_to_history(const char *message) {
+    pthread_mutex_lock(&history_mutex);
+    
+    // Libera a memória da mensagem mais antiga se o buffer estiver cheio
+    if (message_history[history_head] != NULL) {
+        free(message_history[history_head]);
+    }
+
+    // strdup aloca memória e copia a string
+    message_history[history_head] = strdup(message);
+
+    history_head = (history_head + 1) % HISTORY_SIZE;
+    if (history_count < HISTORY_SIZE) {
+        history_count++;
+    }
+
+    pthread_mutex_unlock(&history_mutex);
+}
+
+void send_history_to_client(int client_socket) {
+    char welcome_msg[] = "--- Bem-vindo ao chat! Vendo histórico de mensagens... ---\n";
+    write(client_socket, welcome_msg, strlen(welcome_msg));
+
+    pthread_mutex_lock(&history_mutex);
+    
+    // Calcula o índice da mensagem mais antiga para começar a ler
+    int start_index = (history_head - history_count + HISTORY_SIZE) % HISTORY_SIZE;
+
+    for (int i = 0; i < history_count; i++) {
+        int current_index = (start_index + i) % HISTORY_SIZE;
+        if (message_history[current_index] != NULL) {
+            write(client_socket, message_history[current_index], strlen(message_history[current_index]));
+        }
+    }
+    pthread_mutex_unlock(&history_mutex);
+
+    char end_msg[] = "--- Fim do histórico ---\n";
+    write(client_socket, end_msg, strlen(end_msg));
 }
 
 // Retransmite uma mensagem para todos os clientes, exceto o remetente.
@@ -66,29 +119,33 @@ void broadcast_message(const char *message, int sender_id) {
 // Função executada por cada thread de cliente
 void *handle_client(void *arg) {
     client_t client = *(client_t *)arg;
-    free(arg); // Libera a memória alocada para o argumento
+    free(arg);
     char buffer[BUFFER_SIZE];
     char message_with_id[BUFFER_SIZE + 50];
     char log_buffer[BUFFER_SIZE + 100];
 
-    // Loop para ler mensagens do cliente
+    // Envia o histórico ao novo cliente 
+    send_history_to_client(client.socket);
+
     int read_size;
     while ((read_size = read(client.socket, buffer, BUFFER_SIZE - 1)) > 0) {
         buffer[read_size] = '\0';
-        // Remove a nova linha, se houver
         char *newline = strchr(buffer, '\n');
         if (newline) *newline = '\0';
 
-        // Prepara a mensagem para broadcast e log
+        if (strlen(buffer) == 0) continue; // Ignora mensagens vazias
+
         snprintf(message_with_id, sizeof(message_with_id), "[Cliente %d]: %s\n", client.id, buffer);
         snprintf(log_buffer, sizeof(log_buffer), "Mensagem recebida do Cliente %d: '%s'", client.id, buffer);
         log_message(INFO, log_buffer);
+
+        // Adiciona ao histórico antes de retransmitir
+        add_to_history(message_with_id);
 
         broadcast_message(message_with_id, client.id);
         memset(buffer, 0, BUFFER_SIZE);
     }
 
-    // Se read_size for 0 ou -1, o cliente se desconectou
     close(client.socket);
     pthread_mutex_lock(&clients_mutex);
     remove_client(client.id);
@@ -113,7 +170,9 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    // Inicializa a lista de clientes e o mutex
+    // Inicializa o histórico
+    init_history();
+
     clients = malloc(INITIAL_CAPACITY * sizeof(client_t));
     if (!clients) {
         log_message(ERROR, "Falha ao alocar memória inicial para clientes.");
@@ -121,11 +180,13 @@ int main(int argc, char *argv[]) {
     }
     pthread_mutex_init(&clients_mutex, NULL);
 
-    // Configura o socket do servidor
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(atoi(argv[1]));
+    
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         log_message(ERROR, "Falha no bind do socket.");
@@ -137,7 +198,6 @@ int main(int argc, char *argv[]) {
     snprintf(log_msg, sizeof(log_msg), "Servidor escutando na porta %s", argv[1]);
     log_message(INFO, log_msg);
 
-    // Loop principal para aceitar conexões
     while (1) {
         client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
         if (client_socket < 0) {
@@ -145,7 +205,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Aloca memória para os dados do cliente para passar para a thread
         client_t *new_client = malloc(sizeof(client_t));
         new_client->socket = client_socket;
         new_client->address = client_addr;
@@ -162,13 +221,15 @@ int main(int argc, char *argv[]) {
         if (pthread_create(&tid, NULL, handle_client, (void *)new_client) != 0) {
             log_message(ERROR, "Falha ao criar thread para cliente.");
         }
-        pthread_detach(tid); // A thread se limpará sozinha ao terminar
+        pthread_detach(tid);
     }
 
-    // Limpeza 
+    // Limpeza (código inalcançável)
     free(clients);
     close(server_socket);
     pthread_mutex_destroy(&clients_mutex);
+    pthread_mutex_destroy(&history_mutex);
+    for(int i = 0; i < HISTORY_SIZE; i++) if(message_history[i]) free(message_history[i]);
     log_close();
 
     return 0;
